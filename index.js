@@ -1,3 +1,64 @@
+/*
+ * ST-Hands-Free-Voice — patched build
+ * ----------------------------------------------------------------------
+ * Drop-in replacement for:
+ *   SillyTavern\public\scripts\extensions\third-party\ST-Hands-Free-Voice\index.js
+ *
+ * Original: https://github.com/Flaxify/ST-Hands-Free-Voice  (v2.8)
+ *
+ * Bugs fixed in this version (and why each one mattered):
+ *
+ *  1. AudioContext leak.
+ *     The original set audioContext = null without ever calling .close().
+ *     Browsers cap the number of live AudioContexts (~6 in Chrome).  After
+ *     enough listen cycles, new ones came up dead and the mic detection
+ *     silently broke.  Symptom: it worked for a while, then the mic would
+ *     turn on but never trigger recording, until the page was refreshed.
+ *
+ *  2. AudioContext starting suspended.
+ *     Some browser/autoplay states create the context in 'suspended' state.
+ *     The analyser then reads zero forever.  Now we explicitly resume() it.
+ *
+ *  3. Mic stayed on through the AI's reply.
+ *     Resources were only released after transcription + AI generation.
+ *     Now mediaStream + AudioContext are released the moment recording
+ *     stops, so the mic icon goes off immediately.
+ *
+ *  4. Pending timers / pollers leaking on stop.
+ *     silenceTimer and the recording's setInterval poller were not being
+ *     cleared in stopListening().  They could fire on a torn-down session.
+ *
+ *  5. requestAnimationFrame loop kept running during recording.
+ *     Once speech was detected the rAF loop kept polling redundantly.
+ *     It now exits as soon as recording starts.
+ *
+ *  6. isListening was never reset after recording ended.
+ *     If a new TTS-ended event fired while transcription was still in
+ *     flight, the next startVoiceDetection bailed early.  Now isListening
+ *     is cleared the instant recording stops.
+ *
+ *  7. Hard-coded volume threshold (25) — couldn't be tuned without editing
+ *     code.  Now exposed as a "Mic Sensitivity" setting in the panel.
+ *
+ *  8. Defensive: stopListening() ignores re-entrant calls; close() is
+ *     wrapped in try/catch in case the context is already closed.
+ *
+ *  9. Floating On/Off toggle button.
+ *     A fixed-position button mirrors the "Enable Hands-Free Mode" checkbox.
+ *     Clicking Off immediately calls stopListening() (the old checkbox only
+ *     gated future cycles — an in-progress mic session kept running).
+ *     Clicking On starts listening immediately if no TTS is playing; if TTS
+ *     is mid-playback, the existing 'ended' hook picks up so the mic doesn't
+ *     capture TTS audio.
+ *
+ * 10. Force Off on chat change.
+ *     CHAT_CHANGED resets enabled → false and stops any active session, so
+ *     a fresh conversation always starts silent.
+ *
+ * Behavior NOT changed: provider list, endpoint format, message sending,
+ * settings names (so your existing saved settings still load).
+ */
+
 import { eventSource, event_types, sendMessageAsUser } from '../../../../script.js';
 
 const MODULE_NAME = "HandsFreeVoice";
@@ -29,12 +90,11 @@ const defaultSettings = Object.freeze({
     api_key: "",
     model: "openai/whisper-large-v3-turbo",
     custom_endpoint: "",
-    // Timing
-    delay: 5,           // seconds of initial silence before auto-continue
-    speech_pause: 1.5,  // seconds of in-speech silence before recording cutoff
-    max_recording: 120, // seconds maximum recording length (safety cap)
-    // Formatting
-    quote_speech: false // wrap transcribed text in quotation marks
+    delay: 5,
+    speech_pause: 1.5,
+    max_recording: 120,
+    volume_threshold: 25,   // tunable now
+    quote_speech: false
 });
 
 let settings = {};
@@ -43,17 +103,15 @@ let audioContext = null;
 let analyserNode = null;
 let recorder = null;
 let silenceTimer = null;
+let volumePoller = null;
 let isListening = false;
+let isStopping = false;     // re-entrancy guard
 
-// ─────────────────────────────────────────────────────────────
-// TTS playback-end detection via ST's #tts_audio element
-// ─────────────────────────────────────────────────────────────
 let ttsEndTimer = null;
 
-/**
- * Wait for ST's <audio id="tts_audio"> element to appear in the DOM,
- * then attach ended/play listeners so we know when speech truly stops.
- */
+// ─────────────────────────────────────────────────────────────
+// TTS playback hook
+// ─────────────────────────────────────────────────────────────
 function hookAudioElement() {
     const audio = document.getElementById('tts_audio');
     if (!audio) {
@@ -100,10 +158,46 @@ function getCurrentVolume() {
     return data.reduce((a, b) => a + b, 0) / data.length;
 }
 
+function isTTSPlaying() {
+    const audio = document.getElementById('tts_audio');
+    return !!(audio && !audio.paused && !audio.ended && audio.currentTime > 0);
+}
+
+function syncToggleUI() {
+    $('#hf_enabled').prop('checked', settings.enabled);
+    const $btn = $('#hf_toggle_btn');
+    if ($btn.length) {
+        $btn.toggleClass('hf-on', !!settings.enabled);
+        $btn.toggleClass('hf-off', !settings.enabled);
+        $btn.attr('title', settings.enabled ? 'Voice: ON (click to turn off)' : 'Voice: OFF (click to turn on)');
+        $btn.find('.hf-toggle-label').text(settings.enabled ? 'ON' : 'OFF');
+        $btn.find('i').attr('class', settings.enabled ? 'fa-solid fa-microphone' : 'fa-solid fa-microphone-slash');
+    }
+}
+
+async function setEnabled(enabled) {
+    const wasEnabled = !!settings.enabled;
+    settings.enabled = !!enabled;
+    try { SillyTavern.getContext().saveSettingsDebounced(); } catch (e) { /* ignore */ }
+    syncToggleUI();
+
+    if (!enabled) {
+        // Turning OFF — kill any in-progress session immediately.
+        await stopListening();
+        return;
+    }
+
+    // Turning ON — start listening now unless TTS is mid-playback,
+    // in which case the existing 'ended' handler will start it.
+    if (!wasEnabled && !isListening && !isTTSPlaying()) {
+        await startVoiceDetection();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Init
 // ─────────────────────────────────────────────────────────────
-console.log("🚀 Hands-Free Voice v2.8 loaded");
+console.log("🚀 Hands-Free Voice (patched) loaded");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, () => {
@@ -116,7 +210,7 @@ jQuery(() => {
         }
         settings = context.extensionSettings[MODULE_NAME];
 
-        // Migrate old "endpoint" field → provider
+        // Migrate old "endpoint" field → provider (kept for back-compat).
         if (settings.endpoint !== undefined && settings.provider === undefined) {
             const ep = settings.endpoint || '';
             if (ep.includes('openrouter.ai')) settings.provider = 'openrouter';
@@ -129,14 +223,80 @@ jQuery(() => {
             if (settings[key] === undefined) settings[key] = defaultSettings[key];
         });
 
+        // Always start a session with voice OFF — fresh chats shouldn't
+        // come up with the mic hot.
+        settings.enabled = false;
+
         addSettingsPanel();
         console.log("✅ Settings panel added");
 
+        addFloatingToggle();
+
         hookAudioElement();
 
-        console.log("🎤 Hands-Free Voice v2.8 ready");
+        // Whenever the user switches to a different chat, force OFF and
+        // tear down any active listening session.
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            if (settings.enabled || isListening) {
+                console.log("💤 Chat changed — forcing voice OFF");
+                setEnabled(false);
+            }
+        });
+
+        console.log("🎤 Hands-Free Voice (patched) ready");
     });
 });
+
+function addFloatingToggle() {
+    if ($('#hf_toggle_btn').length) return;
+
+    const css = `
+        <style id="hf_toggle_style">
+            #hf_toggle_btn {
+                position: fixed;
+                right: 16px;
+                bottom: 80px;
+                z-index: 9999;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 8px 12px;
+                border-radius: 999px;
+                border: 1px solid rgba(255,255,255,0.15);
+                background: rgba(40,40,40,0.85);
+                color: #ddd;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+                user-select: none;
+                backdrop-filter: blur(4px);
+                transition: background 0.15s ease, color 0.15s ease;
+            }
+            #hf_toggle_btn:hover { filter: brightness(1.1); }
+            #hf_toggle_btn.hf-on  { background: rgba(40,140,60,0.9); color: #fff; }
+            #hf_toggle_btn.hf-off { background: rgba(80,80,80,0.85); color: #ccc; }
+            #hf_toggle_btn i { font-size: 14px; }
+        </style>`;
+    $('head').append(css);
+
+    const html = `
+        <div id="hf_toggle_btn" role="button" tabindex="0">
+            <i class="fa-solid fa-microphone-slash"></i>
+            <span class="hf-toggle-label">OFF</span>
+        </div>`;
+    $('body').append(html);
+
+    $('#hf_toggle_btn').on('click', () => setEnabled(!settings.enabled));
+    $('#hf_toggle_btn').on('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setEnabled(!settings.enabled);
+        }
+    });
+
+    syncToggleUI();
+}
 
 // ─────────────────────────────────────────────────────────────
 // Settings UI
@@ -150,7 +310,7 @@ function addSettingsPanel() {
     <div class="handsfree-settings">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Hands-Free Voice</b>
+                <b>Hands-Free Voice (patched)</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -165,36 +325,39 @@ function addSettingsPanel() {
                 </select>
 
                 <label>API Key</label>
-                <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-... / gsk_...">
+                <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-... / gsk_... / 'local' for a local server">
 
                 <label>Whisper Model</label>
                 <input type="text" id="hf_model" class="text_pole" placeholder="openai/whisper-large-v3-turbo">
 
                 <div id="hf_custom_endpoint_row" style="display:none">
                     <label>Custom Endpoint URL</label>
-                    <input type="text" id="hf_custom_endpoint" class="text_pole" placeholder="http://localhost:8080/v1">
+                    <input type="text" id="hf_custom_endpoint" class="text_pole" placeholder="http://127.0.0.1:8001/v1">
                 </div>
 
                 <hr>
                 <b>Timing</b>
 
                 <label>Silence Timeout (seconds)</label>
-                <input type="number" id="hf_delay" class="text_pole" min="1" max="60">
+                <input type="number" id="hf_delay" class="text_pole" min="1" max="3600">
                 <small>After TTS ends, how long to wait for you to start speaking before the character auto-continues.</small>
 
                 <label>Speech Pause Tolerance (seconds)</label>
                 <input type="number" id="hf_speech_pause" class="text_pole" min="0.1" max="10" step="0.1">
-                <small>How long a pause mid-speech before recording stops and is sent for transcription. Allows natural pauses.</small>
+                <small>How long a pause mid-speech before recording stops and is sent for transcription.</small>
 
                 <label>Max Recording Length (seconds)</label>
                 <input type="number" id="hf_max_recording" class="text_pole" min="5" max="600">
-                <small>Safety cap on recording length. Prevents the mic running indefinitely if you step away.</small>
+                <small>Safety cap on recording length.</small>
+
+                <label>Mic Sensitivity (volume threshold, 1–100)</label>
+                <input type="number" id="hf_volume_threshold" class="text_pole" min="1" max="100">
+                <small>Lower number = mic triggers on quieter sound. Default 25. Try 10 if your mic is quiet, 40 if room noise keeps falsely triggering it.</small>
 
                 <hr>
                 <b>Formatting</b>
 
                 <label><input type="checkbox" id="hf_quote_speech"> Wrap speech in quotation marks</label>
-                <small>When enabled, transcribed text is sent as "text" instead of plain text.</small>
             </div>
         </div>
     </div>`;
@@ -207,8 +370,7 @@ function bindSettingsUI() {
     const context = SillyTavern.getContext();
 
     $('#hf_enabled').prop('checked', settings.enabled).on('change', function () {
-        settings.enabled = this.checked;
-        context.saveSettingsDebounced();
+        setEnabled(this.checked);
     });
 
     $('#hf_provider').val(settings.provider).on('change', function () {
@@ -252,6 +414,11 @@ function bindSettingsUI() {
         context.saveSettingsDebounced();
     });
 
+    $('#hf_volume_threshold').val(settings.volume_threshold).on('input', function () {
+        settings.volume_threshold = parseFloat(this.value) || defaultSettings.volume_threshold;
+        context.saveSettingsDebounced();
+    });
+
     $('#hf_quote_speech').prop('checked', settings.quote_speech).on('change', function () {
         settings.quote_speech = this.checked;
         context.saveSettingsDebounced();
@@ -265,19 +432,19 @@ function updateCustomEndpointVisibility() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Core logic (TTS playback done → listen → transcribe → send)
+// Core listen → record → transcribe → send loop
 // ─────────────────────────────────────────────────────────────
 async function onTTSPlaybackEnded() {
     await startVoiceDetection();
 
-    // Start silence timeout — if user never speaks, auto-continue
-    if (silenceTimer) clearTimeout(silenceTimer);
+    if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
     silenceTimer = setTimeout(() => {
+        silenceTimer = null;
         if (!isListening) return;
         console.log("⏰ No speech detected – auto-continuing");
         autoContinue();
         stopListening();
-    }, settings.delay * 1000);
+    }, (settings.delay || defaultSettings.delay) * 1000);
 }
 
 async function startVoiceDetection() {
@@ -285,6 +452,13 @@ async function startVoiceDetection() {
     try {
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        // Some browsers create the context suspended (autoplay policy).
+        // Without this, the analyser reads zero forever.
+        if (audioContext.state === 'suspended') {
+            try { await audioContext.resume(); } catch (e) { /* ignore */ }
+        }
+
         const source = audioContext.createMediaStreamSource(mediaStream);
         analyserNode = audioContext.createAnalyser();
         analyserNode.fftSize = 512;
@@ -292,21 +466,24 @@ async function startVoiceDetection() {
 
         isListening = true;
         let speechDetected = false;
+        const threshold = Number(settings.volume_threshold) || defaultSettings.volume_threshold;
 
         const checkLevel = () => {
-            if (!isListening) return;
+            if (!isListening || speechDetected) return;
             const volume = getCurrentVolume();
-            if (volume > 25 && !speechDetected) {
+            if (volume > threshold) {
                 speechDetected = true;
-                console.log("🗣️ Speech detected – recording");
-                clearTimeout(silenceTimer);
+                console.log(`🗣️ Speech detected (vol=${volume.toFixed(1)} > ${threshold}) – recording`);
+                if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
                 startRecording();
+                return;     // exit rAF loop — recording's own poller takes over
             }
             requestAnimationFrame(checkLevel);
         };
-        checkLevel();
+        requestAnimationFrame(checkLevel);
     } catch (err) {
         console.error("❌ Mic access failed:", err);
+        await stopListening();
     }
 }
 
@@ -317,7 +494,16 @@ async function startRecording() {
 
     recorder.ondataavailable = e => chunks.push(e.data);
     recorder.onstop = async () => {
+        // Flag listening as done immediately so a new TTS-ended event
+        // can start a fresh session even before transcription returns.
+        isListening = false;
+
         const blob = new Blob(chunks, { type: 'audio/webm' });
+
+        // Release mic + audio engine NOW.  No reason to keep the mic
+        // icon lit through the whole AI reply.
+        await releaseAudioResources();
+
         await transcribeAndSend(blob);
     };
 
@@ -326,72 +512,100 @@ async function startRecording() {
     const speechPauseMs = (settings.speech_pause || defaultSettings.speech_pause) * 1000;
     const maxRecordingMs = (settings.max_recording || defaultSettings.max_recording) * 1000;
     const pollIntervalMs = 100;
+    const threshold = Number(settings.volume_threshold) || defaultSettings.volume_threshold;
 
     let silentFor = 0;
     const startTime = Date.now();
 
-    // Poll for in-speech silence and max-length cutoff
-    const silencePoller = setInterval(() => {
+    if (volumePoller) clearInterval(volumePoller);
+    volumePoller = setInterval(() => {
         if (!recorder || recorder.state !== "recording") {
-            clearInterval(silencePoller);
+            clearInterval(volumePoller);
+            volumePoller = null;
             return;
         }
 
-        // Safety cap: max recording length
         if (Date.now() - startTime >= maxRecordingMs) {
             console.log(`⏱️ Max recording length (${settings.max_recording}s) reached – stopping`);
-            clearInterval(silencePoller);
+            clearInterval(volumePoller);
+            volumePoller = null;
             recorder.stop();
             return;
         }
 
-        // Check for post-speech silence
         const volume = getCurrentVolume();
-        if (volume <= 25) {
+        if (volume <= threshold) {
             silentFor += pollIntervalMs;
             if (silentFor >= speechPauseMs) {
                 console.log(`🤫 Speech pause (${settings.speech_pause}s) reached – stopping recording`);
-                clearInterval(silencePoller);
+                clearInterval(volumePoller);
+                volumePoller = null;
                 recorder.stop();
             }
         } else {
-            silentFor = 0; // reset on any sound
+            silentFor = 0;
         }
     }, pollIntervalMs);
 }
 
-function stopListening() {
-    isListening = false;
-    if (recorder && recorder.state === "recording") recorder.stop();
-    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-    mediaStream = null;
-    audioContext = null;
+async function releaseAudioResources() {
+    if (mediaStream) {
+        try { mediaStream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+        mediaStream = null;
+    }
+    if (audioContext) {
+        try {
+            if (audioContext.state !== 'closed') {
+                await audioContext.close();
+            }
+        } catch (e) { /* ignore */ }
+        audioContext = null;
+    }
     analyserNode = null;
-    recorder = null;
+}
+
+async function stopListening() {
+    if (isStopping) return;     // ignore re-entrant calls
+    isStopping = true;
+    try {
+        isListening = false;
+
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        if (volumePoller) { clearInterval(volumePoller); volumePoller = null; }
+
+        if (recorder && recorder.state === "recording") {
+            // Detach onstop so we don't accidentally trigger a transcribe/send
+            // when stopListening is called for cleanup (vs. for sending audio).
+            recorder.onstop = null;
+            try { recorder.stop(); } catch (e) { /* ignore */ }
+        }
+        recorder = null;
+
+        await releaseAudioResources();
+    } finally {
+        isStopping = false;
+    }
 }
 
 async function transcribeAndSend(audioBlob) {
     if (!settings.api_key) {
-        console.error("❌ No API key set in Hands-Free Voice settings");
-        stopListening();
+        console.error("❌ No API key set in Hands-Free Voice settings (use 'local' for local servers)");
         return;
     }
 
     const endpoint = getEffectiveEndpoint();
     if (!endpoint) {
         console.error("❌ No endpoint configured. Set a custom endpoint URL in settings.");
-        stopListening();
         return;
     }
 
     const providerFormat = PROVIDERS[settings.provider]?.format ?? 'multipart';
-
     console.log(`🎙️ Transcribing via ${settings.provider} (${providerFormat}), blob: ${audioBlob.size} bytes`);
 
     let res;
     try {
         if (providerFormat === 'json_base64') {
-            // ── OpenRouter: JSON body with base64-encoded audio ──────────────
+            // OpenRouter: JSON body with base64-encoded audio
             const arrayBuffer = await audioBlob.arrayBuffer();
             const bytes = new Uint8Array(arrayBuffer);
             let binary = '';
@@ -402,9 +616,9 @@ async function transcribeAndSend(audioBlob) {
             const base64 = btoa(binary);
 
             const mimeType = audioBlob.type || 'audio/webm';
-            const format = mimeType.includes('ogg')  ? 'ogg'
-                         : mimeType.includes('mp4')  ? 'mp4'
-                         : mimeType.includes('wav')  ? 'wav'
+            const format = mimeType.includes('ogg') ? 'ogg'
+                         : mimeType.includes('mp4') ? 'mp4'
+                         : mimeType.includes('wav') ? 'wav'
                          : 'webm';
 
             res = await fetch(`${endpoint}/audio/transcriptions`, {
@@ -419,7 +633,7 @@ async function transcribeAndSend(audioBlob) {
                 })
             });
         } else {
-            // ── Groq / Local / OpenAI-compatible: multipart FormData ─────────
+            // Groq / Local / OpenAI-compatible: multipart FormData
             const formData = new FormData();
             formData.append("file", audioBlob, "recording.webm");
             formData.append("model", settings.model);
@@ -434,7 +648,6 @@ async function transcribeAndSend(audioBlob) {
         if (!res.ok) {
             const errorBody = await res.text();
             console.error(`❌ Whisper API error ${res.status}:`, errorBody);
-            stopListening();
             return;
         }
 
@@ -447,7 +660,6 @@ async function transcribeAndSend(audioBlob) {
             }
             console.log("📝 Whisper transcribed:", transcribed);
             await sendMessageAsUser(transcribed);
-            // Trigger character response
             await SillyTavern.getContext().generate('normal');
         } else {
             console.log("🔇 No speech recognized in audio");
@@ -455,8 +667,6 @@ async function transcribeAndSend(audioBlob) {
     } catch (err) {
         console.error("❌ Whisper API error:", err);
     }
-
-    stopListening();
 }
 
 async function autoContinue() {
