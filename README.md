@@ -1,7 +1,7 @@
 # ST Hands-Free Voice
 
 A **SillyTavern extension** that enables near real-time, hands-free voice conversation with AI characters.  
-Talk. Listen. Reply. No keyboard required.
+Talk. Listen. Reply. No keyboard required. This plugin was created by Flaxify. This just has a bug fix and a button to pause listening for voice without shutting servers down. Useful when using local Whisper.
 
 ---
 
