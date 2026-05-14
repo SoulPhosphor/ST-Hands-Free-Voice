@@ -94,7 +94,8 @@ const defaultSettings = Object.freeze({
     speech_pause: 1.5,
     max_recording: 120,
     volume_threshold: 25,   // tunable now
-    quote_speech: false
+    quote_speech: false,
+    empty_response_timeout: 2   // seconds to wait after generation ends before deciding the model produced nothing
 });
 
 let settings = {};
@@ -108,6 +109,8 @@ let isListening = false;
 let isStopping = false;     // re-entrancy guard
 
 let ttsEndTimer = null;
+let generationWatchdog = null;
+let retryUsedThisTurn = false;
 
 // ─────────────────────────────────────────────────────────────
 // TTS playback hook
@@ -175,6 +178,70 @@ function syncToggleUI() {
     }
 }
 
+function clearGenerationWatchdog() {
+    if (generationWatchdog) {
+        clearTimeout(generationWatchdog);
+        generationWatchdog = null;
+    }
+}
+
+function getLastAssistantMessageContent() {
+    try {
+        const chat = SillyTavern.getContext().chat || [];
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const m = chat[i];
+            if (!m || m.is_user || m.is_system) continue;
+            return (m.mes || '').trim();
+        }
+    } catch (e) { /* ignore */ }
+    return '';
+}
+
+function onGenerationEnded() {
+    if (!settings.enabled) return;
+    clearGenerationWatchdog();
+
+    const timeoutMs = Math.max(0, (Number(settings.empty_response_timeout) || 0) * 1000);
+    if (timeoutMs <= 0) return; // watchdog disabled
+
+    generationWatchdog = setTimeout(async () => {
+        generationWatchdog = null;
+
+        // TTS started — real response in flight, nothing to do.
+        if (isTTSPlaying()) return;
+
+        const lastContent = getLastAssistantMessageContent();
+
+        // The model did produce visible text but TTS didn't start (maybe
+        // TTS is off, or the audio failed to load). Don't retry; just
+        // make sure we don't hang forever with the mic dead.
+        if (lastContent.length > 0) {
+            if (!isListening) {
+                console.log("📭 Generation ended with text but no TTS — re-arming mic");
+                onTTSPlaybackEnded();
+            }
+            return;
+        }
+
+        // Empty response. Auto-retry once per user turn.
+        if (!retryUsedThisTurn) {
+            retryUsedThisTurn = true;
+            console.warn("⚠️ Model produced no visible response — auto-retrying once");
+            try {
+                await SillyTavern.getContext().generate('normal');
+            } catch (e) {
+                console.error("❌ Retry generation threw:", e);
+                if (!isListening) onTTSPlaybackEnded();
+            }
+            return;
+        }
+
+        // Already retried and still empty — give the mic back to the user.
+        console.warn("⚠️ Model still produced no response after retry — re-arming mic");
+        if (!isListening) onTTSPlaybackEnded();
+    }, timeoutMs);
+}
+
 async function setEnabled(enabled) {
     const wasEnabled = !!settings.enabled;
     settings.enabled = !!enabled;
@@ -183,6 +250,8 @@ async function setEnabled(enabled) {
 
     if (!enabled) {
         // Turning OFF — kill any in-progress session immediately.
+        clearGenerationWatchdog();
+        retryUsedThisTurn = false;
         await stopListening();
         return;
     }
@@ -237,11 +306,23 @@ jQuery(() => {
         // Whenever the user switches to a different chat, force OFF and
         // tear down any active listening session.
         eventSource.on(event_types.CHAT_CHANGED, () => {
+            clearGenerationWatchdog();
+            retryUsedThisTurn = false;
             if (settings.enabled || isListening) {
                 console.log("💤 Chat changed — forcing voice OFF");
                 setEnabled(false);
             }
         });
+
+        // Watchdog: catch the case where generation ends but the model
+        // produced no visible text (so no TTS fires, so the cycle stalls).
+        if (event_types.GENERATION_ENDED) {
+            eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
+        }
+        // Reset the per-turn retry flag whenever a new user message is sent.
+        if (event_types.MESSAGE_SENT) {
+            eventSource.on(event_types.MESSAGE_SENT, () => { retryUsedThisTurn = false; });
+        }
 
         console.log("🎤 Hands-Free Voice (patched) ready");
     });
@@ -354,6 +435,10 @@ function addSettingsPanel() {
                 <input type="number" id="hf_volume_threshold" class="text_pole" min="1" max="100">
                 <small>Lower number = mic triggers on quieter sound. Default 25. Try 10 if your mic is quiet, 40 if room noise keeps falsely triggering it.</small>
 
+                <label>Empty Response Timeout (seconds)</label>
+                <input type="number" id="hf_empty_response_timeout" class="text_pole" min="0" max="60" step="0.5">
+                <small>If the AI finishes generating but produces no visible text within this many seconds (e.g. GLM thinks but outputs nothing), auto-retry once, then re-arm the mic. Default 2. Set to 0 to disable.</small>
+
                 <hr>
                 <b>Formatting</b>
 
@@ -416,6 +501,12 @@ function bindSettingsUI() {
 
     $('#hf_volume_threshold').val(settings.volume_threshold).on('input', function () {
         settings.volume_threshold = parseFloat(this.value) || defaultSettings.volume_threshold;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_empty_response_timeout').val(settings.empty_response_timeout).on('input', function () {
+        const v = parseFloat(this.value);
+        settings.empty_response_timeout = Number.isFinite(v) ? Math.max(0, v) : defaultSettings.empty_response_timeout;
         context.saveSettingsDebounced();
     });
 
